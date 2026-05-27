@@ -53,6 +53,15 @@ in
       git
     ];
 
+    # Local patches applied on top of the source tree.
+    patches = [
+      ./patches/global-search-ast.patch
+      ./patches/inline-completion.patch
+      ./patches/rounded-corners.patch
+      ./patches/borderless-info-popup.patch
+      ./patches/lsp-completion-command.patch
+    ];
+
     buildType = "release";
 
     name = with builtins; (fromTOML (readFile ./helix-term/Cargo.toml)).package.name;

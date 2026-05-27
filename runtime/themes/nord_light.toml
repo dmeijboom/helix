@@ -27,6 +27,7 @@
 "ui.virtual" = "nord8"
 "ui.virtual.ruler" = {bg="nord4"}
 "ui.virtual.inlay-hint" = { fg = "nord3", modifiers = ["italic"] }
+"ui.virtual.inline-completion" = { fg = "nord3", modifiers = ["italic"] }
 "ui.virtual.jump-label" = { fg = "nord11", modifiers = ["bold"] }
 
 

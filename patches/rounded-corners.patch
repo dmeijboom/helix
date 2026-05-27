@@ -1,0 +1,224 @@
+diff --git a/helix-term/src/ui/completion.rs b/helix-term/src/ui/completion.rs
+index 0bf00cea9..4296bdd31 100644
+--- a/helix-term/src/ui/completion.rs
++++ b/helix-term/src/ui/completion.rs
+@@ -21,6 +21,7 @@
+     Config, Utf32Str,
+ };
+ use tui::text::Spans;
++use tui::widgets::BorderType;
+ use tui::{buffer::Buffer as Surface, text::Span};
+ 
+ use std::cmp::Reverse;
+@@ -573,7 +574,12 @@ fn render(&mut self, area: Rect, surface: &mut Surface, cx: &mut Context) {
+ 
+         if cx.editor.popup_border() {
+             use tui::widgets::{Block, Widget};
+-            Widget::render(Block::bordered(), doc_area, surface);
++            let border_type = BorderType::new(cx.editor.config().rounded_corners);
++            Widget::render(
++                Block::bordered().border_type(border_type),
++                doc_area,
++                surface,
++            );
+         }
+ 
+         markdown_doc.render(doc_area, surface, cx);
+diff --git a/helix-term/src/ui/info.rs b/helix-term/src/ui/info.rs
+index 1cac7c86c..9083b6f1d 100644
+--- a/helix-term/src/ui/info.rs
++++ b/helix-term/src/ui/info.rs
+@@ -3,7 +3,7 @@
+ use helix_view::info::Info;
+ use tui::buffer::Buffer as Surface;
+ use tui::text::Text;
+-use tui::widgets::{Block, Paragraph, Widget};
++use tui::widgets::{Block, BorderType, Paragraph, Widget};
+ 
+ impl Component for Info {
+     fn render(&mut self, viewport: Rect, surface: &mut Surface, cx: &mut Context) {
+@@ -23,9 +23,11 @@ fn render(&mut self, viewport: Rect, surface: &mut Surface, cx: &mut Context) {
+         ));
+         surface.clear_with(area, popup_style);
+ 
++        let border_type = BorderType::new(cx.editor.config().rounded_corners);
+         let block = Block::bordered()
+             .title(self.title.as_ref())
+-            .border_style(popup_style);
++            .border_style(popup_style)
++            .border_type(border_type);
+ 
+         let margin = Margin::horizontal(1);
+         let inner = block.inner(area).inner(margin);
+diff --git a/helix-term/src/ui/picker.rs b/helix-term/src/ui/picker.rs
+index c61321f6f..16a5e17e5 100644
+--- a/helix-term/src/ui/picker.rs
++++ b/helix-term/src/ui/picker.rs
+@@ -699,12 +699,13 @@ fn render_picker(&mut self, area: Rect, surface: &mut Surface, cx: &mut Context)
+         let background = cx.editor.theme.get("ui.background");
+         surface.clear_with(area, background);
+ 
+-        const BLOCK: Block<'_> = Block::bordered();
++        let border_type = BorderType::new(cx.editor.config().rounded_corners);
++        let block: Block<'_> = Block::bordered().border_type(border_type);
+ 
+         // calculate the inner area inside the box
+-        let inner = BLOCK.inner(area);
++        let inner = block.inner(area);
+ 
+-        BLOCK.render(area, surface);
++        block.render(area, surface);
+ 
+         // -- Render the input bar:
+ 
+@@ -888,14 +889,15 @@ fn render_preview(&mut self, area: Rect, surface: &mut Surface, cx: &mut Context
+         let directory = cx.editor.theme.get("ui.text.directory");
+         surface.clear_with(area, background);
+ 
+-        const BLOCK: Block<'_> = Block::bordered();
++        let border_type = BorderType::new(cx.editor.config().rounded_corners);
++        let block: Block<'_> = Block::bordered().border_type(border_type);
+ 
+         // calculate the inner area inside the box
+-        let inner = BLOCK.inner(area);
++        let inner = block.inner(area);
+         // 1 column gap on either side
+         let margin = Margin::horizontal(1);
+         let inner = inner.inner(margin);
+-        BLOCK.render(area, surface);
++        block.render(area, surface);
+ 
+         if let Some((preview, range)) = self.get_preview(cx.editor) {
+             let doc = match preview.document() {
+@@ -1168,7 +1170,8 @@ fn handle_event(&mut self, event: &Event, ctx: &mut Context) -> EventResult {
+     }
+ 
+     fn cursor(&self, area: Rect, editor: &Editor) -> (Option<Position>, CursorKind) {
+-        let block = Block::bordered();
++        let block = Block::bordered()
++            .border_type(BorderType::new(editor.config().rounded_corners));
+         // calculate the inner area inside the box
+         let inner = block.inner(area);
+ 
+diff --git a/helix-term/src/ui/popup.rs b/helix-term/src/ui/popup.rs
+index 1419eae6c..3afb648fd 100644
+--- a/helix-term/src/ui/popup.rs
++++ b/helix-term/src/ui/popup.rs
+@@ -5,7 +5,7 @@
+ };
+ use tui::{
+     buffer::Buffer as Surface,
+-    widgets::{Block, Widget},
++    widgets::{Block, BorderType, Widget},
+ };
+ 
+ use helix_core::Position;
+@@ -337,8 +337,9 @@ fn render(&mut self, viewport: Rect, surface: &mut Surface, cx: &mut Context) {
+ 
+         let mut inner = area;
+         if render_borders {
++            let border_type = BorderType::new(cx.editor.config().rounded_corners);
+             inner = area.inner(Margin::all(1));
+-            Widget::render(Block::bordered(), area, surface);
++            Widget::render(Block::bordered().border_type(border_type), area, surface);
+         }
+         let border = usize::from(render_borders);
+ 
+diff --git a/helix-term/src/ui/prompt.rs b/helix-term/src/ui/prompt.rs
+index 04b785fe9..d00357737 100644
+--- a/helix-term/src/ui/prompt.rs
++++ b/helix-term/src/ui/prompt.rs
+@@ -9,7 +9,7 @@
+ use std::{borrow::Cow, ops::RangeFrom};
+ use tui::buffer::Buffer as Surface;
+ use tui::text::Span;
+-use tui::widgets::{Block, Widget};
++use tui::widgets::{Block, BorderType, Widget};
+ 
+ use helix_core::{
+     unicode::segmentation::{GraphemeCursor, UnicodeSegmentation},
+@@ -502,7 +502,8 @@ pub fn render_prompt(&mut self, area: Rect, surface: &mut Surface, cx: &mut Cont
+ 
+             let block = Block::bordered()
+                 // .title(self.title.as_str())
+-                .border_style(background);
++                .border_style(background)
++                .border_type(BorderType::new(cx.editor.config().rounded_corners));
+ 
+             let inner = block.inner(area).inner(Margin::horizontal(1));
+ 
+diff --git a/helix-term/src/ui/select.rs b/helix-term/src/ui/select.rs
+index e85f629eb..38c6a57d9 100644
+--- a/helix-term/src/ui/select.rs
++++ b/helix-term/src/ui/select.rs
+@@ -3,7 +3,7 @@
+ use helix_view::{graphics::Rect, Editor};
+ use tui::{
+     buffer::Buffer as Surface,
+-    widgets::{Block, Widget as _},
++    widgets::{Block, BorderType, Widget as _},
+ };
+ 
+ use crate::compositor::{Component, Context, Event, EventResult};
+@@ -57,7 +57,8 @@ fn required_size(&mut self, viewport: (u16, u16)) -> Option<(u16, u16)> {
+     }
+ 
+     fn render(&mut self, area: Rect, surface: &mut Surface, cx: &mut Context) {
+-        const BLOCK: Block<'_> = Block::bordered();
++        let block: Block<'_> = Block::bordered()
++            .border_type(BorderType::new(cx.editor.config().rounded_corners));
+ 
+         // +---------------------+
+         // | message             |
+@@ -90,9 +91,9 @@ fn render(&mut self, area: Rect, surface: &mut Surface, cx: &mut Context) {
+         let text = cx.editor.theme.get("ui.text");
+         let message_box = area.with_height(message_height + 2);
+         surface.clear_with(message_box, background.patch(text));
+-        BLOCK.render(message_box, surface);
+         // Add horizontal padding so the message isn't too close to the border.
+-        let message_area = BLOCK.inner(message_box).clip_left(1).clip_right(1);
++        let message_area = block.inner(message_box).clip_left(1).clip_right(1);
++        block.render(message_box, surface);
+         self.message.render(message_area, surface, cx);
+ 
+         // Options menu
+diff --git a/helix-tui/src/widgets/block.rs b/helix-tui/src/widgets/block.rs
+index ee7aa7573..dacc814e7 100644
+--- a/helix-tui/src/widgets/block.rs
++++ b/helix-tui/src/widgets/block.rs
+@@ -17,6 +17,14 @@ pub enum BorderType {
+ }
+ 
+ impl BorderType {
++    pub fn new(rounded: bool) -> Self {
++        if rounded {
++            Self::Rounded
++        } else {
++            Self::default()
++        }
++    }
++
+     pub fn line_symbols(border_type: Self) -> line::Set {
+         match border_type {
+             Self::Plain => line::NORMAL,
+diff --git a/helix-view/src/editor.rs b/helix-view/src/editor.rs
+index 2146bc877..2aca2aea7 100644
+--- a/helix-view/src/editor.rs
++++ b/helix-view/src/editor.rs
+@@ -410,6 +410,8 @@ pub struct Config {
+     pub smart_tab: Option<SmartTabConfig>,
+     /// Draw border around popups.
+     pub popup_border: PopupBorderConfig,
++    /// Draw rounded border corners
++    pub rounded_corners: bool,
+     /// Which indent heuristic to use when a new line is inserted
+     #[serde(default)]
+     pub indent_heuristic: IndentationHeuristic,
+@@ -1147,6 +1149,7 @@ fn default() -> Self {
+             trim_trailing_whitespace: false,
+             smart_tab: Some(SmartTabConfig::default()),
+             popup_border: PopupBorderConfig::None,
++            rounded_corners: false,
+             indent_heuristic: IndentationHeuristic::default(),
+             jump_label_alphabet: ('a'..='z').collect(),
+             inline_diagnostics: InlineDiagnosticsConfig::default(),
