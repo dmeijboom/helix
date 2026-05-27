@@ -1,0 +1,340 @@
+diff --git a/helix-term/src/commands.rs b/helix-term/src/commands.rs
+index eaf5d33f3..be6a8470d 100644
+--- a/helix-term/src/commands.rs
++++ b/helix-term/src/commands.rs
+@@ -383,6 +383,7 @@ pub fn doc(&self) -> &str {
+         search_selection_detect_word_boundaries, "Use current selection as the search pattern, automatically wrapping with `\\b` on word boundaries",
+         make_search_word_bounded, "Modify current search to make it word bounded",
+         global_search, "Global search in workspace folder",
++        global_search_ast, "Global ast-grep search",
+         extend_line, "Select current line, if already selected, extend to another line based on the anchor",
+         extend_line_below, "Select current line, if already selected, extend to next line",
+         extend_line_above, "Select current line, if already selected, extend to previous line",
+@@ -2810,6 +2811,315 @@ struct GlobalSearchConfig {
+     cx.push_layer(Box::new(overlaid(picker)));
+ }
+ 
++/// Global semantic search using the external `ast-grep` CLI.
++///
++/// The query is an ast-grep pattern (e.g. `fn $N($$$)`). Language is
++/// auto-detected per file from its extension. Unsaved buffers are searched
++/// via `ast-grep --stdin` using the buffer's file extension as `--lang`
++/// (skipped if the buffer has no extension). Requires the `ast-grep` binary
++/// in `PATH`.
++///
++/// An optional trailing ` kind:<node-kind>` suffix returns only AST nodes
++/// of that kind whose subtree contains the pattern (implemented via
++/// `ast-grep scan --inline-rules` with `kind + has + pattern`). Examples:
++///   `unsafe kind:function_item`   // unsafe-containing fn items (Rust)
++///   `await kind:function_item`    // async fn items containing await
++///   `print kind:function_definition`  // Python defs containing print
++fn global_search_ast(cx: &mut Context) {
++    #[derive(Debug)]
++    struct FileResult {
++        path: PathBuf,
++        /// 0 indexed line start
++        line_start: usize,
++        /// 0 indexed line end
++        line_end: usize,
++    }
++
++    impl FileResult {
++        fn new(path: &Path, line_start: usize, line_end: usize) -> Self {
++            Self {
++                path: path.to_path_buf(),
++                line_start,
++                line_end,
++            }
++        }
++    }
++
++    struct GlobalSearchConfig {
++        directory_style: Style,
++        number_style: Style,
++        colon_style: Style,
++    }
++
++    #[derive(serde::Deserialize)]
++    struct AstMatch {
++        file: String,
++        range: AstRange,
++    }
++    #[derive(serde::Deserialize)]
++    struct AstRange {
++        start: AstPos,
++        end: AstPos,
++    }
++    #[derive(serde::Deserialize)]
++    struct AstPos {
++        line: usize,
++    }
++
++    // ast-grep `scan` requires `language:` per inline rule. We emit one rule
++    // per common language; ast-grep applies each only to files of that
++    // language, so cross-language queries are auto-filtered.
++    const SCAN_LANGS: &[&str] = &[
++        "rust", "python", "typescript", "tsx", "javascript", "go", "java", "c", "cpp", "csharp",
++        "ruby", "swift", "kotlin", "scala", "bash", "lua", "php", "html", "css", "json", "yaml",
++    ];
++
++    fn build_inline_rule(pattern: &str, kind: &str, lang: &str) -> String {
++        let escaped = pattern.replace('\\', "\\\\").replace('"', "\\\"");
++        format!(
++            "id: r0\nlanguage: {lang}\nrule:\n  kind: {kind}\n  has:\n    stopBy: end\n    pattern: \"{escaped}\"\nseverity: info\nmessage: m\n"
++        )
++    }
++
++    let config = GlobalSearchConfig {
++        directory_style: cx.editor.theme.get("ui.text.directory"),
++        number_style: cx.editor.theme.get("constant.numeric.integer"),
++        colon_style: cx.editor.theme.get("punctuation"),
++    };
++
++    let columns = [
++        PickerColumn::new("path", |item: &FileResult, config: &GlobalSearchConfig| {
++            let path = helix_stdx::path::get_relative_path(&item.path);
++
++            let directories = path
++                .parent()
++                .filter(|p| !p.as_os_str().is_empty())
++                .map(|p| format!("{}{}", p.display(), std::path::MAIN_SEPARATOR))
++                .unwrap_or_default();
++
++            let filename = item
++                .path
++                .file_name()
++                .map(|f| f.to_string_lossy().into_owned())
++                .unwrap_or_default();
++
++            Cell::from(Spans::from(vec![
++                Span::styled(directories, config.directory_style),
++                Span::raw(filename),
++                Span::styled(":", config.colon_style),
++                Span::styled((item.line_start + 1).to_string(), config.number_style),
++            ]))
++        }),
++        PickerColumn::hidden("contents"),
++    ];
++
++    let get_files = |query: &str,
++                     editor: &mut Editor,
++                     _config: std::sync::Arc<GlobalSearchConfig>,
++                     injector: &ui::picker::Injector<_, _>| {
++        if query.is_empty() {
++            return async { Ok(()) }.boxed();
++        }
++        // Parse optional trailing `kind:<value>` suffix into a --selector flag.
++        // Right-anchored to keep the pattern verbatim (patterns may contain
++        // spaces, dollars, braces).
++        let (pattern, selector) = match query.rsplit_once(" kind:") {
++            Some((pat, sel)) if !sel.is_empty() && !sel.contains(char::is_whitespace) => {
++                (pat.trim_end().to_owned(), Some(sel.to_owned()))
++            }
++            _ => (query.to_owned(), None),
++        };
++
++        let search_root = helix_stdx::env::current_working_dir();
++        if !search_root.exists() {
++            return async { Err(anyhow::anyhow!("Current working directory does not exist")) }
++                .boxed();
++        }
++
++        // Snapshot every open buffer with a path; these are searched via --stdin
++        // (so unsaved edits match) and excluded from the on-disk pass to avoid
++        // stale duplicates. Each buffer's language is derived from its file
++        // extension (ast-grep accepts common extensions as `--lang`).
++        let buffers: Vec<(PathBuf, String, String)> = editor
++            .documents()
++            .filter_map(|d| {
++                let path = d.path()?.to_path_buf();
++                let lang = path.extension()?.to_str()?.to_owned();
++                Some((path, lang, d.text().to_string()))
++            })
++            .collect();
++        let exclude: HashSet<PathBuf> = buffers
++            .iter()
++            .map(|(p, _, _)| std::fs::canonicalize(p).unwrap_or_else(|_| p.clone()))
++            .collect();
++
++        let injector = injector.clone();
++        async move {
++            use std::process::Stdio;
++            use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
++            use tokio::process::Command;
++
++            // (a) On-disk pass over the workspace.
++            // Without kind: a single `run -p P` auto-detects per file.
++            // With kind: one `scan --inline-rules` per language (each rule
++            // self-filters by language); spawned sequentially so a parse
++            // failure for one language (e.g. a kind that doesn't exist
++            // there) doesn't abort the others.
++            let langs: Vec<&str> = if selector.is_some() {
++                SCAN_LANGS.to_vec()
++            } else {
++                vec![""]
++            };
++            for lang in &langs {
++                let mut cmd = Command::new("ast-grep");
++                if let Some(kind) = &selector {
++                    let rule = build_inline_rule(&pattern, kind, lang);
++                    cmd.arg("scan").args(["--inline-rules", &rule]);
++                } else {
++                    cmd.arg("run").args(["--pattern", &pattern]);
++                }
++                cmd.arg("--json=stream")
++                    .arg(&search_root)
++                    .stdout(Stdio::piped())
++                    .stderr(Stdio::null());
++                let mut child = match cmd.spawn() {
++                    Ok(c) => c,
++                    Err(e) => return Err(anyhow::anyhow!("Failed to spawn ast-grep: {e}")),
++                };
++                if let Some(stdout) = child.stdout.take() {
++                    let mut lines = BufReader::new(stdout).lines();
++                    while let Some(line) = lines.next_line().await? {
++                        let Ok(m) = serde_json::from_str::<AstMatch>(&line) else {
++                            continue;
++                        };
++                        let path = PathBuf::from(&m.file);
++                        let canon =
++                            std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
++                        if exclude.contains(&canon) {
++                            continue;
++                        }
++                        if injector
++                            .push(FileResult::new(
++                                &path,
++                                m.range.start.line,
++                                m.range.end.line,
++                            ))
++                            .is_err()
++                        {
++                            break;
++                        }
++                    }
++                }
++                let _ = child.wait().await;
++            }
++
++            // (b) One ast-grep invocation per open buffer over stdin.
++            for (path, lang, text) in buffers {
++                let mut cmd = Command::new("ast-grep");
++                if let Some(kind) = &selector {
++                    let rule = build_inline_rule(&pattern, kind, lang.as_str());
++                    cmd.arg("scan").args(["--inline-rules", &rule]);
++                } else {
++                    cmd.arg("run")
++                        .args(["--lang", &lang])
++                        .args(["--pattern", &pattern]);
++                }
++                cmd.arg("--json=stream")
++                    .arg("--stdin")
++                    .stdin(Stdio::piped())
++                    .stdout(Stdio::piped())
++                    .stderr(Stdio::null());
++                let mut child = cmd
++                    .spawn()
++                    .map_err(|e| anyhow::anyhow!("Failed to spawn ast-grep: {e}"))?;
++                if let Some(mut stdin) = child.stdin.take() {
++                    let _ = stdin.write_all(text.as_bytes()).await;
++                    drop(stdin);
++                }
++                if let Some(stdout) = child.stdout.take() {
++                    let mut lines = BufReader::new(stdout).lines();
++                    while let Some(line) = lines.next_line().await? {
++                        let Ok(m) = serde_json::from_str::<AstMatch>(&line) else {
++                            continue;
++                        };
++                        if injector
++                            .push(FileResult::new(
++                                &path,
++                                m.range.start.line,
++                                m.range.end.line,
++                            ))
++                            .is_err()
++                        {
++                            break;
++                        }
++                    }
++                }
++                let _ = child.wait().await;
++            }
++            Ok(())
++        }
++        .boxed()
++    };
++
++    let reg = cx.register.unwrap_or('/');
++    cx.editor.registers.last_search_register = reg;
++
++    let picker = Picker::new(
++        columns,
++        1, // contents
++        [],
++        config,
++        move |cx,
++              FileResult {
++                  path,
++                  line_start,
++                  line_end,
++                  ..
++              },
++              action| {
++            let doc = match cx.editor.open(path, action) {
++                Ok(id) => doc_mut!(cx.editor, &id),
++                Err(e) => {
++                    cx.editor
++                        .set_error(format!("Failed to open file '{}': {}", path.display(), e));
++                    return;
++                }
++            };
++
++            let line_start = *line_start;
++            let line_end = *line_end;
++            let view = view_mut!(cx.editor);
++            let text = doc.text();
++            if line_start >= text.len_lines() {
++                cx.editor.set_error(
++                    "The line you jumped to does not exist anymore because the file has changed.",
++                );
++                return;
++            }
++            let start = text.line_to_char(line_start);
++            let end = text.line_to_char((line_end + 1).min(text.len_lines()));
++
++            doc.set_selection(view.id, Selection::single(start, end));
++            if action.align_view(view, doc.id()) {
++                align_view(doc, view, Align::Center);
++            }
++        },
++    )
++    .with_preview(
++        |_editor,
++         FileResult {
++             path,
++             line_start,
++             line_end,
++             ..
++         }| { Some((path.as_path().into(), Some((*line_start, *line_end)))) },
++    )
++    .with_history_register(Some(reg))
++    .with_dynamic_query(get_files, Some(275));
++
++    cx.push_layer(Box::new(overlaid(picker)));
++}
++
+ enum Extend {
+     Above,
+     Below,
+diff --git a/helix-term/src/keymap/default.rs b/helix-term/src/keymap/default.rs
+index 849f47c71..5e802eb3d 100644
+--- a/helix-term/src/keymap/default.rs
++++ b/helix-term/src/keymap/default.rs
+@@ -285,6 +285,7 @@ pub fn default() -> HashMap<Mode, KeyTrie> {
+             "P" => paste_clipboard_before,
+             "R" => replace_selections_with_clipboard,
+             "/" => global_search,
++            "A" => global_search_ast,
+             "k" => hover,
+             "r" => rename_symbol,
+             "h" => select_references_to_symbol_under_cursor,

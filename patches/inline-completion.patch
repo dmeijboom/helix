@@ -1,0 +1,1059 @@
+diff --git a/helix-core/src/syntax/config.rs b/helix-core/src/syntax/config.rs
+index f4e22ad9..a2e1a3f1 100644
+--- a/helix-core/src/syntax/config.rs
++++ b/helix-core/src/syntax/config.rs
+@@ -324,6 +324,7 @@ pub enum LanguageServerFeature {
+     InlayHints,
+     DocumentColors,
+     CallHierarchy,
++    InlineCompletion,
+ }
+ 
+ impl Display for LanguageServerFeature {
+@@ -351,6 +352,7 @@ fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+             InlayHints => "inlay-hints",
+             DocumentColors => "document-colors",
+             CallHierarchy => "call-hierarchy",
++            InlineCompletion => "inline-completion",
+         };
+         write!(f, "{feature}",)
+     }
+diff --git a/helix-lsp-types/src/inline_completion.rs b/helix-lsp-types/src/inline_completion.rs
+index 8289858a..519b11eb 100644
+--- a/helix-lsp-types/src/inline_completion.rs
++++ b/helix-lsp-types/src/inline_completion.rs
+@@ -55,7 +55,7 @@ pub struct InlineCompletionParams {
+     pub context: InlineCompletionContext,
+ }
+ 
+-/// Describes how an [`InlineCompletionItemProvider`] was triggered.
++/// Describes how an `InlineCompletionItemProvider` was triggered.
+ ///
+ /// @since 3.18.0
+ #[derive(Eq, PartialEq, Clone, Copy, Deserialize, Serialize)]
+@@ -137,7 +137,7 @@ pub struct InlineCompletionItem {
+     /// Is used both for the preview and the accept operation.
+     pub insert_text: String,
+     /// A text that is used to decide if this inline completion should be
+-    /// shown. When `falsy` the [`InlineCompletionItem::insertText`] is
++    /// shown. When `falsy` the [`InlineCompletionItem::insert_text`] is
+     /// used.
+     ///
+     /// An inline completion is shown if the text to replace is a prefix of the
+diff --git a/helix-lsp-types/src/lib.rs b/helix-lsp-types/src/lib.rs
+index afba1f2c..5d27b5dd 100644
+--- a/helix-lsp-types/src/lib.rs
++++ b/helix-lsp-types/src/lib.rs
+@@ -153,9 +153,7 @@ fn try_from(value: &str) -> Result<Self, Self::Error> {
+ mod inline_value;
+ pub use inline_value::*;
+ 
+-#[cfg(feature = "proposed")]
+ mod inline_completion;
+-#[cfg(feature = "proposed")]
+ pub use inline_completion::*;
+ 
+ mod moniker;
+@@ -1602,7 +1600,6 @@ pub struct TextDocumentClientCapabilities {
+     ///
+     /// @since 3.18.0
+     #[serde(skip_serializing_if = "Option::is_none")]
+-    #[cfg(feature = "proposed")]
+     pub inline_completion: Option<InlineCompletionClientCapabilities>,
+ }
+ 
+@@ -2066,7 +2063,6 @@ pub struct ServerCapabilities {
+     ///
+     /// @since 3.18.0
+     #[serde(skip_serializing_if = "Option::is_none")]
+-    #[cfg(feature = "proposed")]
+     pub inline_completion_provider: Option<OneOf<bool, InlineCompletionOptions>>,
+ 
+     /// Experimental server capabilities.
+diff --git a/helix-lsp-types/src/request.rs b/helix-lsp-types/src/request.rs
+index 7502546b..d04d5873 100644
+--- a/helix-lsp-types/src/request.rs
++++ b/helix-lsp-types/src/request.rs
+@@ -661,10 +661,8 @@ impl Request for PrepareRenameRequest {
+ }
+ 
+ #[derive(Debug)]
+-#[cfg(feature = "proposed")]
+ pub enum InlineCompletionRequest {}
+ 
+-#[cfg(feature = "proposed")]
+ impl Request for InlineCompletionRequest {
+     type Params = InlineCompletionParams;
+     type Result = Option<InlineCompletionResponse>;
+diff --git a/helix-lsp/src/client.rs b/helix-lsp/src/client.rs
+index 2ce5c60d..74f2cf4c 100644
+--- a/helix-lsp/src/client.rs
++++ b/helix-lsp/src/client.rs
+@@ -407,6 +407,10 @@ pub fn supports_feature(&self, feature: LanguageServerFeature) -> bool {
+                         | CallHierarchyServerCapability::Options(_)
+                 )
+             ),
++            LanguageServerFeature::InlineCompletion => matches!(
++                capabilities.inline_completion_provider,
++                Some(OneOf::Left(true) | OneOf::Right(_))
++            ),
+         }
+     }
+ 
+@@ -734,6 +738,9 @@ pub(crate) async fn initialize(&self, enable_snippets: bool) -> Result<lsp::Init
+                     call_hierarchy: Some(lsp::DynamicRegistrationClientCapabilities {
+                         dynamic_registration: Some(false),
+                     }),
++                    inline_completion: Some(lsp::InlineCompletionClientCapabilities {
++                        dynamic_registration: Some(false),
++                    }),
+                     document_symbol: Some(lsp::DocumentSymbolClientCapabilities {
+                         dynamic_registration: Some(false),
+                         symbol_kind: Some(lsp::SymbolKindCapability {
+@@ -1262,6 +1269,29 @@ pub fn text_document_range_inlay_hints(
+         Some(self.call::<lsp::request::InlayHintRequest>(params))
+     }
+ 
++    pub fn inline_completion(
++        &self,
++        text_document: lsp::TextDocumentIdentifier,
++        position: lsp::Position,
++        context: lsp::InlineCompletionContext,
++        work_done_token: Option<lsp::ProgressToken>,
++    ) -> Option<impl Future<Output = Result<Option<lsp::InlineCompletionResponse>>>> {
++        if !self.supports_feature(LanguageServerFeature::InlineCompletion) {
++            return None;
++        }
++
++        let params = lsp::InlineCompletionParams {
++            text_document_position: lsp::TextDocumentPositionParams {
++                text_document,
++                position,
++            },
++            context,
++            work_done_progress_params: lsp::WorkDoneProgressParams { work_done_token },
++        };
++
++        Some(self.call::<lsp::request::InlineCompletionRequest>(params))
++    }
++
+     pub fn text_document_document_color(
+         &self,
+         text_document: lsp::TextDocumentIdentifier,
+diff --git a/helix-term/src/commands.rs b/helix-term/src/commands.rs
+index 5d63cdd3..b4a2473d 100644
+--- a/helix-term/src/commands.rs
++++ b/helix-term/src/commands.rs
+@@ -516,6 +516,12 @@ pub fn doc(&self) -> &str {
+         keep_primary_selection, "Keep primary selection",
+         remove_primary_selection, "Remove primary selection",
+         completion, "Invoke completion popup",
++        inline_completion_accept, "Accept inline completion",
++        inline_completion_dismiss, "Dismiss inline completion",
++        inline_completion_next, "Cycle to next inline completion",
++        inline_completion_prev, "Cycle to previous inline completion",
++        inline_completion_trigger, "Trigger inline completion",
++        inline_completion_accept_or_smart_tab, "Accept inline completion if active, else smart tab",
+         hover, "Show docs for item under cursor",
+         toggle_comments, "Comment/uncomment selections",
+         toggle_line_comments, "Line comment/uncomment selections",
+@@ -5473,6 +5479,62 @@ pub fn completion(cx: &mut Context) {
+         .trigger_completions(cursor, doc.id(), view.id);
+ }
+ 
++pub fn inline_completion_accept(cx: &mut Context) {
++    let (view, doc) = current!(cx.editor);
++    if let Some(c) = doc.inline_completions.take_and_clear() {
++        let text = doc.text();
++        let cursor = doc.selection(view.id).primary().cursor(text.slice(..));
++        let new_cursor = cursor + c.ghost_text.chars().count();
++        let t = Transaction::change(
++            text,
++            std::iter::once((cursor, c.replace_range.to(), Some(c.ghost_text.into()))),
++        )
++        .with_selection(Selection::point(new_cursor));
++        doc.apply(&t, view.id);
++    }
++}
++
++pub fn inline_completion_dismiss(cx: &mut Context) {
++    if doc_mut!(cx.editor)
++        .inline_completions
++        .take_and_clear()
++        .is_none()
++    {
++        normal_mode(cx);
++    }
++}
++
++pub fn inline_completion_next(cx: &mut Context) {
++    use helix_core::movement::Direction;
++    let doc = doc_mut!(cx.editor);
++    doc.inline_completions.cycle(Direction::Forward);
++    doc.inline_completions
++        .rebuild_overlays(&mut doc.inline_completion_overlays);
++}
++
++pub fn inline_completion_prev(cx: &mut Context) {
++    use helix_core::movement::Direction;
++    let doc = doc_mut!(cx.editor);
++    doc.inline_completions.cycle(Direction::Backward);
++    doc.inline_completions
++        .rebuild_overlays(&mut doc.inline_completion_overlays);
++}
++
++pub fn inline_completion_trigger(_cx: &mut Context) {
++    use helix_lsp::lsp;
++    crate::handlers::inline_completion::trigger_inline_completion(
++        lsp::InlineCompletionTriggerKind::Invoked,
++    );
++}
++
++pub fn inline_completion_accept_or_smart_tab(cx: &mut Context) {
++    if doc!(cx.editor).inline_completions.current().is_some() {
++        inline_completion_accept(cx);
++    } else {
++        insert::smart_tab(cx);
++    }
++}
++
+ // comments
+ type CommentTransactionFn = fn(
+     line_token: Option<&str>,
+diff --git a/helix-term/src/handlers.rs b/helix-term/src/handlers.rs
+index 46afc4ce..2fdfda3e 100644
+--- a/helix-term/src/handlers.rs
++++ b/helix-term/src/handlers.rs
+@@ -14,6 +14,7 @@
+ 
+ use self::document_colors::DocumentColorsHandler;
+ use self::document_links::DocumentLinksHandler;
++use self::inline_completion::InlineCompletionHandler;
+ 
+ mod auto_save;
+ mod code_action_hint;
+@@ -22,6 +23,7 @@
+ mod document_colors;
+ mod document_highlight;
+ mod document_links;
++pub mod inline_completion;
+ mod prompt;
+ mod signature_help;
+ mod snippet;
+@@ -30,7 +32,7 @@
+ pub fn setup(config: Arc<ArcSwap<Config>>) -> Handlers {
+     events::register();
+ 
+-    let event_tx = completion::CompletionHandler::new(config).spawn();
++    let event_tx = completion::CompletionHandler::new(config.clone()).spawn();
+     let signature_hints = SignatureHelpHandler::new().spawn();
+     let auto_save = AutoSaveHandler::new().spawn();
+     let code_action_hint = code_action_hint::Handler::default().spawn();
+@@ -39,6 +41,7 @@ pub fn setup(config: Arc<ArcSwap<Config>>) -> Handlers {
+     let word_index = word_index::Handler::spawn();
+     let pull_diagnostics = PullDiagnosticsHandler::default().spawn();
+     let pull_all_documents_diagnostics = PullAllDocumentsDiagnosticHandler::default().spawn();
++    let inline_completions = InlineCompletionHandler::new(config.clone()).spawn();
+ 
+     let handlers = Handlers {
+         completions: helix_view::handlers::completion::CompletionHandler::new(event_tx),
+@@ -50,6 +53,7 @@ pub fn setup(config: Arc<ArcSwap<Config>>) -> Handlers {
+         pull_diagnostics,
+         pull_all_documents_diagnostics,
+         code_action_hint,
++        inline_completions,
+     };
+ 
+     helix_view::handlers::register_hooks(&handlers);
+@@ -62,6 +66,7 @@ pub fn setup(config: Arc<ArcSwap<Config>>) -> Handlers {
+     snippet::register_hooks(&handlers);
+     document_colors::register_hooks(&handlers);
+     document_links::register_hooks(&handlers);
++    inline_completion::register_hooks(&handlers);
+     prompt::register_hooks(&handlers);
+     workspace_trust::register_hooks(&handlers);
+     handlers
+diff --git a/helix-term/src/handlers/inline_completion.rs b/helix-term/src/handlers/inline_completion.rs
+new file mode 100644
+index 00000000..a74f435d
+--- /dev/null
++++ b/helix-term/src/handlers/inline_completion.rs
+@@ -0,0 +1,287 @@
++use std::sync::Arc;
++
++use crate::events::OnModeSwitch;
++use arc_swap::ArcSwap;
++use helix_core::{syntax::config::LanguageServerFeature, text_annotations::Overlay, Range};
++use helix_event::{register_hook, send_blocking};
++use helix_lsp::{lsp, util::lsp_range_to_range};
++use helix_view::{
++    document::{InlineCompletion, Mode},
++    events::{DocumentDidChange, SelectionDidChange},
++    handlers::Handlers,
++};
++use tokio::time::Instant;
++
++use crate::{config::Config, job};
++
++pub(super) struct InlineCompletionHandler {
++    config: Arc<ArcSwap<Config>>,
++}
++
++impl InlineCompletionHandler {
++    pub fn new(config: Arc<ArcSwap<Config>>) -> Self {
++        Self { config }
++    }
++}
++
++impl helix_event::AsyncHook for InlineCompletionHandler {
++    type Event = ();
++
++    fn handle_event(&mut self, _: Self::Event, _: Option<Instant>) -> Option<Instant> {
++        Some(Instant::now() + self.config.load().editor.inline_completion_timeout)
++    }
++
++    fn finish_debounce(&mut self) {
++        trigger_inline_completion(lsp::InlineCompletionTriggerKind::Automatic);
++    }
++}
++
++/// Request inline completion from LSP servers. Called by debounce handler (auto)
++/// or directly by manual trigger command.
++pub fn trigger_inline_completion(trigger_kind: lsp::InlineCompletionTriggerKind) {
++    job::dispatch_blocking(move |editor, _| {
++        // Only trigger in insert mode
++        if editor.mode != Mode::Insert {
++            return;
++        }
++        let (view, doc) = current!(editor);
++        // DocumentId is monotonic; ViewId uses slotmap versioning (reused slots get new version).
++        let doc_id = doc.id();
++        let view_id = view.id;
++        let doc_version = doc.version();
++        // Capture tab_width for ghost text processing
++        let tab_width = doc.tab_width();
++
++        for ls in doc.language_servers_with_feature(LanguageServerFeature::InlineCompletion) {
++            let pos = doc.position(view.id, ls.offset_encoding());
++            let context = lsp::InlineCompletionContext {
++                trigger_kind,
++                selected_completion_info: None,
++            };
++            let Some(fut) = ls.inline_completion(doc.identifier(), pos, context, None) else {
++                continue;
++            };
++
++            let offset_encoding = ls.offset_encoding();
++            tokio::spawn(async move {
++                let Ok(Some(resp)) = fut.await else { return };
++                let items = match resp {
++                    lsp::InlineCompletionResponse::Array(v) => v,
++                    lsp::InlineCompletionResponse::List(l) => l.items,
++                };
++                if items.is_empty() {
++                    return;
++                }
++
++                job::dispatch(move |editor, _| {
++                    // User may have left insert mode, switched view/doc, or edited the document
++                    let (view, doc) = current!(editor);
++                    if editor.mode != Mode::Insert
++                        || view.id != view_id
++                        || doc.id() != doc_id
++                        || doc.version() != doc_version
++                    {
++                        return;
++                    }
++                    let text = doc.text();
++                    let cursor = doc.selection(view.id).primary().cursor(text.slice(..));
++
++                    let completions: Vec<_> = items
++                        .into_iter()
++                        .filter_map(|item| {
++                            let replace_range = item
++                                .range
++                                .and_then(|r| lsp_range_to_range(text, r, offset_encoding))
++                                .unwrap_or_else(|| Range::point(cursor));
++
++                            // Discard if cursor moved outside range (e.g., arrow keys don't change version)
++                            if !replace_range.contains_range(&Range::point(cursor)) {
++                                return None;
++                            }
++
++                            // Skip already-typed chars
++                            let skip = cursor.saturating_sub(replace_range.from());
++                            let ghost_text: String = item.insert_text.chars().skip(skip).collect();
++
++                            if ghost_text.is_empty() {
++                                return None;
++                            }
++
++                            let at_eol = text.get_char(cursor).is_none_or(|c| c == '\n');
++
++                            // Process ghost text: expand tabs and split into lines
++                            let tab_spaces: String = " ".repeat(tab_width);
++                            let mut lines: Vec<String> = ghost_text
++                                .split('\n')
++                                .map(|line| line.replace('\t', &tab_spaces))
++                                .collect();
++
++                            let first_line = lines.remove(0);
++
++                            // Get rest of line for mid-line cases
++                            let line_end = text.line_to_char(text.char_to_line(cursor) + 1);
++                            let rest_of_line: String = text
++                                .slice(cursor..line_end)
++                                .chars()
++                                .take_while(|c| *c != '\n')
++                                .collect();
++
++                            let (overlays, overflow_text, eol_ghost_text, additional_lines) =
++                                if at_eol {
++                                    // At EOL: use Decoration to render first line
++                                    let eol_text = if !first_line.is_empty() {
++                                        Some(first_line)
++                                    } else {
++                                        None
++                                    };
++                                    (Vec::new(), None, eol_text, lines)
++                                } else {
++                                    // Mid-line: use overlays for first line (no cursor shift)
++                                    // Additional lines (if any) rendered as virtual lines below
++                                    let is_multiline = !lines.is_empty();
++
++                                    let after_cursor: String =
++                                        rest_of_line.chars().skip(1).collect();
++
++                                    // Trim matching suffix for display only (single-line only)
++                                    let mut display_first_line = first_line.clone();
++                                    if !is_multiline {
++                                        for suffix_len in (1..=after_cursor.len()).rev() {
++                                            if let Some(suffix) = after_cursor.get(..suffix_len) {
++                                                if display_first_line.ends_with(suffix) {
++                                                    let new_len =
++                                                        display_first_line.len() - suffix.len();
++                                                    display_first_line.truncate(new_len);
++                                                    break;
++                                                }
++                                            }
++                                        }
++                                    }
++
++                                    // Build preview:
++                                    // - Single-line: first line + after_cursor (shows full result)
++                                    // - Multi-line: first line padded with spaces to cover rest_of_line
++                                    //   (rest_of_line is pushed down to last ghost line, so blank it here)
++                                    let preview = if is_multiline {
++                                        let rest_len = rest_of_line.chars().count();
++                                        let first_len = display_first_line.chars().count();
++                                        if first_len < rest_len {
++                                            // Pad with spaces to cover rest_of_line
++                                            format!(
++                                                "{}{}",
++                                                display_first_line,
++                                                " ".repeat(rest_len - first_len)
++                                            )
++                                        } else {
++                                            display_first_line
++                                        }
++                                    } else {
++                                        format!("{}{}", display_first_line, after_cursor)
++                                    };
++
++                                    // Create overlay for each position
++                                    let mut overlays = Vec::new();
++                                    for (i, preview_char) in preview.chars().enumerate() {
++                                        if i >= rest_of_line.chars().count() {
++                                            break;
++                                        }
++                                        overlays.push(Overlay::new(
++                                            cursor + i,
++                                            preview_char.to_string(),
++                                        ));
++                                    }
++
++                                    // Overflow: preview chars beyond rest_of_line
++                                    let overflow: String = preview
++                                        .chars()
++                                        .skip(rest_of_line.chars().count())
++                                        .collect();
++                                    let overflow_text = if !overflow.is_empty() {
++                                        Some(overflow)
++                                    } else {
++                                        None
++                                    };
++
++                                    // For multi-line, append rest_of_line to last line ("pushed down")
++                                    // But only if ghost text doesn't already contain rest_of_line
++                                    // (if it does, ghost text is replacing cursor position content)
++                                    let additional_lines = if is_multiline {
++                                        let mut result = lines;
++                                        let ghost_contains_rest = first_line
++                                            .contains(&rest_of_line)
++                                            || result.iter().any(|l| l.contains(&rest_of_line));
++                                        if !ghost_contains_rest {
++                                            if let Some(last) = result.last_mut() {
++                                                last.push_str(&rest_of_line);
++                                            }
++                                        }
++                                        result
++                                    } else {
++                                        lines
++                                    };
++
++                                    (overlays, overflow_text, None, additional_lines)
++                                };
++
++                            Some(InlineCompletion {
++                                ghost_text,
++                                replace_range,
++                                cursor_char_idx: cursor,
++                                overlays,
++                                overflow_text,
++                                eol_ghost_text,
++                                additional_lines,
++                            })
++                        })
++                        .collect();
++
++                    for completion in completions {
++                        doc.inline_completions.push(completion);
++                    }
++
++                    // Rebuild overlay cache
++                    doc.inline_completions
++                        .rebuild_overlays(&mut doc.inline_completion_overlays);
++                })
++                .await;
++            });
++        }
++    });
++}
++
++pub(super) fn register_hooks(handlers: &Handlers) {
++    let tx = handlers.inline_completions.clone();
++
++    register_hook!(move |event: &mut DocumentDidChange<'_>| {
++        // Clear stale completion: it was computed for the previous document state
++        event.doc.inline_completions.take_and_clear();
++        // Also clear overlay cache
++        event.doc.inline_completion_overlays.clear();
++        // Ignore changes caused by a preview being displayed
++        if event.ghost_transaction {
++            return Ok(());
++        }
++
++        if event.doc.config.load().inline_completion_auto_trigger {
++            send_blocking(&tx, ());
++        }
++        Ok(())
++    });
++
++    // Clear inline completions when cursor moves (e.g., arrow keys)
++    register_hook!(move |event: &mut SelectionDidChange<'_>| {
++        event.doc.inline_completions.take_and_clear();
++        event.doc.inline_completion_overlays.clear();
++        Ok(())
++    });
++
++    // Clear inline completions when leaving insert mode
++    register_hook!(move |event: &mut OnModeSwitch<'_, '_>| {
++        if event.old_mode == Mode::Insert && event.new_mode != Mode::Insert {
++            let (_, doc) = current!(event.cx.editor);
++            doc.inline_completions.take_and_clear();
++            doc.inline_completion_overlays.clear();
++        }
++        Ok(())
++    });
++}
+diff --git a/helix-term/src/keymap/default.rs b/helix-term/src/keymap/default.rs
+index 849f47c7..376bbe5a 100644
+--- a/helix-term/src/keymap/default.rs
++++ b/helix-term/src/keymap/default.rs
+@@ -383,6 +383,7 @@ pub fn default() -> HashMap<Mode, KeyTrie> {
+ 
+         "C-s" => commit_undo_checkpoint,
+         "C-x" => completion,
++        "C-y" => inline_completion_accept,
+         "C-r" => insert_register,
+ 
+         "C-w" | "A-backspace" => delete_word_backward,
+diff --git a/helix-term/src/ui/editor.rs b/helix-term/src/ui/editor.rs
+index 3bd66f94..5d2822e7 100644
+--- a/helix-term/src/ui/editor.rs
++++ b/helix-term/src/ui/editor.rs
+@@ -8,7 +8,9 @@
+     ui::{
+         document::{render_document, LinePos, TextRenderer},
+         statusline,
+-        text_decorations::{self, Decoration, DecorationManager, InlineDiagnostics},
++        text_decorations::{
++            self, Decoration, DecorationManager, InlineCompletionDecoration, InlineDiagnostics,
++        },
+         Completion, ProgressSpinners,
+     },
+ };
+@@ -192,6 +194,45 @@ pub fn render_view(
+                 primary_cursor,
+             });
+         }
++        // Add inline completion decoration (renders EOL ghost text, overflow, and additional lines)
++        if let Some(completion) = doc.inline_completions.current() {
++            let has_eol = completion.eol_ghost_text.is_some();
++            let has_overflow = completion.overflow_text.is_some();
++            let has_additional = !completion.additional_lines.is_empty();
++            if has_eol || has_overflow || has_additional {
++                let cursor_line = doc.text().char_to_line(primary_cursor);
++                let style = theme.get("ui.virtual.inline-completion");
++
++                // Get cursor style for EOL first char overlay effect (mode-dependent)
++                let cursor_style = match editor.mode() {
++                    Mode::Insert => theme
++                        .try_get("ui.cursor.primary.insert")
++                        .or_else(|| theme.try_get("ui.cursor.insert"))
++                        .or_else(|| theme.try_get("ui.cursor.primary"))
++                        .unwrap_or_else(|| theme.get("ui.cursor")),
++                    Mode::Select => theme
++                        .try_get("ui.cursor.primary.select")
++                        .or_else(|| theme.try_get("ui.cursor.select"))
++                        .or_else(|| theme.try_get("ui.cursor.primary"))
++                        .unwrap_or_else(|| theme.get("ui.cursor")),
++                    Mode::Normal => theme
++                        .try_get("ui.cursor.primary.normal")
++                        .or_else(|| theme.try_get("ui.cursor.normal"))
++                        .or_else(|| theme.try_get("ui.cursor.primary"))
++                        .unwrap_or_else(|| theme.get("ui.cursor")),
++                };
++
++                decorations.add_decoration(InlineCompletionDecoration::new(
++                    cursor_line,
++                    completion.eol_ghost_text.as_deref(),
++                    completion.overflow_text.as_deref(),
++                    &completion.additional_lines,
++                    style,
++                    Some(cursor_style),
++                ));
++            }
++        }
++
+         let width = view.inner_width(doc);
+         let config = doc.config.load();
+         let enable_cursor_line = view
+diff --git a/helix-term/src/ui/text_decorations.rs b/helix-term/src/ui/text_decorations.rs
+index 7aef4729..e302f89f 100644
+--- a/helix-term/src/ui/text_decorations.rs
++++ b/helix-term/src/ui/text_decorations.rs
+@@ -7,8 +7,10 @@
+ use crate::ui::document::{LinePos, TextRenderer};
+ 
+ pub use diagnostics::InlineDiagnostics;
++pub use inline_completion::InlineCompletionDecoration;
+ 
+ mod diagnostics;
++mod inline_completion;
+ 
+ /// Decorations are the primary mechanism for extending the text rendering.
+ ///
+diff --git a/helix-term/src/ui/text_decorations/inline_completion.rs b/helix-term/src/ui/text_decorations/inline_completion.rs
+new file mode 100644
+index 00000000..583fa69c
+--- /dev/null
++++ b/helix-term/src/ui/text_decorations/inline_completion.rs
+@@ -0,0 +1,148 @@
++use helix_core::unicode::segmentation::UnicodeSegmentation;
++use helix_core::unicode::width::UnicodeWidthStr;
++use helix_core::Position;
++use helix_view::theme::Style;
++
++use crate::ui::document::{LinePos, TextRenderer};
++use crate::ui::text_decorations::Decoration;
++
++/// Decoration for rendering inline completion ghost text.
++/// Handles EOL first-line ghost text, mid-line overflow, and multi-line additional lines.
++pub struct InlineCompletionDecoration<'a> {
++    /// Document line where the cursor is (where the completion starts).
++    cursor_doc_line: usize,
++    /// First line ghost text when at EOL (rendered at end of line).
++    eol_ghost_text: Option<&'a str>,
++    /// Overflow text for mid-line (preview chars beyond original line length).
++    overflow_text: Option<&'a str>,
++    /// Additional lines to render (after the first line).
++    additional_lines: &'a [String],
++    /// Style for ghost text.
++    style: Style,
++    /// Cursor style for first grapheme at EOL (to appear "on" block cursor).
++    cursor_style: Option<Style>,
++    /// Track if we've already rendered for this line.
++    rendered: bool,
++}
++
++impl<'a> InlineCompletionDecoration<'a> {
++    pub fn new(
++        cursor_doc_line: usize,
++        eol_ghost_text: Option<&'a str>,
++        overflow_text: Option<&'a str>,
++        additional_lines: &'a [String],
++        style: Style,
++        cursor_style: Option<Style>,
++    ) -> Self {
++        Self {
++            cursor_doc_line,
++            eol_ghost_text,
++            overflow_text,
++            additional_lines,
++            style,
++            cursor_style,
++            rendered: false,
++        }
++    }
++}
++
++impl Decoration for InlineCompletionDecoration<'_> {
++    fn reset_pos(&mut self, _pos: usize) -> usize {
++        self.rendered = false;
++        usize::MAX
++    }
++
++    fn render_virt_lines(
++        &mut self,
++        renderer: &mut TextRenderer,
++        pos: LinePos,
++        virt_off: Position,
++    ) -> Position {
++        // Only render on the cursor's document line
++        if pos.doc_line != self.cursor_doc_line || self.rendered {
++            return Position::new(0, 0);
++        }
++
++        self.rendered = true;
++
++        let mut col_offset = 0;
++
++        // Render EOL first-line ghost text at end of current line
++        if let Some(eol_text) = self.eol_ghost_text {
++            // Subtract 1 because virt_off.col includes newline width, but cursor is ON the newline cell
++            let col_pos = virt_off.col.saturating_sub(1);
++            let mut col = renderer.viewport.x + col_pos as u16;
++            let max_width = renderer.viewport.width.saturating_sub(col_pos as u16) as usize;
++
++            let mut graphemes = eol_text.graphemes(true);
++
++            // First grapheme with cursor style (appears "on" block cursor)
++            if let Some(first_g) = graphemes.next() {
++                let first_style = self.cursor_style.unwrap_or(self.style);
++                let first_width = first_g.width();
++                renderer.set_string_truncated(
++                    col,
++                    pos.visual_line,
++                    first_g,
++                    max_width,
++                    |_| first_style,
++                    true,
++                    false,
++                );
++                col += first_width as u16;
++                col_offset += first_width;
++            }
++
++            // Rest of ghost text with normal ghost style
++            let rest: String = graphemes.collect();
++            if !rest.is_empty() {
++                let remaining_width = max_width.saturating_sub(col_offset);
++                renderer.set_string_truncated(
++                    col,
++                    pos.visual_line,
++                    &rest,
++                    remaining_width,
++                    |_| self.style,
++                    true,
++                    false,
++                );
++                col_offset += rest.width();
++            }
++        }
++
++        // Render mid-line overflow at EOL (preview chars beyond original line length)
++        if let Some(overflow) = self.overflow_text {
++            // Render at end of line (virt_off.col - 1 for newline cell)
++            let col_pos = virt_off.col.saturating_sub(1);
++            let col = renderer.viewport.x + col_pos as u16;
++            let max_width = renderer.viewport.width.saturating_sub(col_pos as u16) as usize;
++
++            renderer.set_string_truncated(
++                col,
++                pos.visual_line,
++                overflow,
++                max_width,
++                |_| self.style,
++                true,
++                false,
++            );
++            col_offset += overflow.width();
++        }
++
++        // Render each additional line in the virtual line space
++        for (i, line) in self.additional_lines.iter().enumerate() {
++            let row = pos.visual_line + virt_off.row as u16 + i as u16;
++            renderer.set_string_truncated(
++                renderer.viewport.x,
++                row,
++                line,
++                renderer.viewport.width as usize,
++                |_| self.style,
++                true,
++                false,
++            );
++        }
++
++        Position::new(self.additional_lines.len(), col_offset)
++    }
++}
+diff --git a/helix-view/src/annotations.rs b/helix-view/src/annotations.rs
+index 4c630487..05345a4c 100644
+--- a/helix-view/src/annotations.rs
++++ b/helix-view/src/annotations.rs
+@@ -1 +1,2 @@
+ pub mod diagnostics;
++pub mod inline_completion;
+diff --git a/helix-view/src/annotations/inline_completion.rs b/helix-view/src/annotations/inline_completion.rs
+new file mode 100644
+index 00000000..f9ad2f25
+--- /dev/null
++++ b/helix-view/src/annotations/inline_completion.rs
+@@ -0,0 +1,46 @@
++use std::cell::Cell;
++
++use helix_core::text_annotations::LineAnnotation;
++use helix_core::Position;
++
++/// LineAnnotation implementation for multi-line inline completion ghost text.
++/// Reserves virtual lines after the cursor line for additional ghost text lines.
++pub struct InlineCompletionLines {
++    /// Document line where the cursor is (where the completion starts).
++    cursor_doc_line: usize,
++    /// Number of additional lines to render after the cursor line.
++    additional_lines_count: usize,
++    /// Track if we've already reserved lines for this render pass.
++    reserved: Cell<bool>,
++}
++
++impl InlineCompletionLines {
++    pub fn new(cursor_doc_line: usize, additional_lines: &[String]) -> Box<dyn LineAnnotation> {
++        Box::new(Self {
++            cursor_doc_line,
++            additional_lines_count: additional_lines.len(),
++            reserved: Cell::new(false),
++        })
++    }
++}
++
++impl LineAnnotation for InlineCompletionLines {
++    fn reset_pos(&mut self, _char_idx: usize) -> usize {
++        self.reserved.set(false);
++        usize::MAX
++    }
++
++    fn insert_virtual_lines(
++        &mut self,
++        _line_end_char_idx: usize,
++        _line_end_visual_pos: Position,
++        doc_line: usize,
++    ) -> Position {
++        // Only reserve lines on the cursor's document line
++        if doc_line == self.cursor_doc_line && !self.reserved.get() {
++            self.reserved.set(true);
++            return Position::new(self.additional_lines_count, 0);
++        }
++        Position::new(0, 0)
++    }
++}
+diff --git a/helix-view/src/document.rs b/helix-view/src/document.rs
+index 72aa97f9..a6945fd6 100644
+--- a/helix-view/src/document.rs
++++ b/helix-view/src/document.rs
+@@ -110,6 +110,71 @@ fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+         serializer.collect_str(self)
+     }
+ }
++
++/// Inline completion data for ghost text display and acceptance.
++pub struct InlineCompletion {
++    /// Ghost text to display/insert (typed prefix already removed).
++    pub ghost_text: String,
++    /// Range to replace: `from()` = prefix start, `to()` = replacement end.
++    pub replace_range: Range,
++    /// Char index where completion starts (cursor position when received).
++    pub cursor_char_idx: usize,
++    /// Overlays for mid-line ghost text (replace chars in-place, no cursor shift).
++    pub overlays: Vec<Overlay>,
++    /// Overflow text for mid-line (preview chars beyond original line length).
++    pub overflow_text: Option<String>,
++    /// First line ghost text when at EOL (rendered via Decoration, not annotation).
++    pub eol_ghost_text: Option<String>,
++    /// Additional lines for multi-line ghost text.
++    pub additional_lines: Vec<String>,
++}
++
++/// List of inline completions with cycling support.
++#[derive(Default)]
++pub struct InlineCompletions {
++    items: Vec<InlineCompletion>,
++    index: usize,
++}
++
++impl InlineCompletions {
++    pub fn push(&mut self, item: InlineCompletion) {
++        self.items.push(item);
++    }
++
++    pub fn current(&self) -> Option<&InlineCompletion> {
++        self.items.get(self.index)
++    }
++
++    pub fn cycle(&mut self, direction: helix_core::movement::Direction) {
++        if !self.items.is_empty() {
++            let len = self.items.len();
++            self.index = match direction {
++                helix_core::movement::Direction::Forward => (self.index + 1) % len,
++                helix_core::movement::Direction::Backward => (self.index + len - 1) % len,
++            };
++        }
++    }
++
++    pub fn take_and_clear(&mut self) -> Option<InlineCompletion> {
++        if self.items.is_empty() {
++            return None;
++        }
++        let item = self.items.swap_remove(self.index);
++        self.items.clear();
++        self.index = 0;
++        Some(item)
++    }
++
++    /// Rebuild the overlay cache from the current completion.
++    pub fn rebuild_overlays(&self, overlays: &mut Vec<Overlay>) {
++        overlays.clear();
++
++        if let Some(completion) = self.current() {
++            overlays.extend(completion.overlays.iter().cloned());
++        }
++    }
++}
++
+ /// A snapshot of the text of a document that we want to write out to disk
+ #[derive(Debug, Clone)]
+ pub struct DocumentSavedEvent {
+@@ -159,6 +224,11 @@ pub struct Document {
+     /// update from the LSP
+     pub inlay_hints_oudated: bool,
+ 
++    /// Inline completions (ghost text) for the document.
++    pub inline_completions: InlineCompletions,
++    /// Cached overlays for ghost text (replace chars in-place, no cursor shift).
++    pub inline_completion_overlays: Vec<Overlay>,
++
+     path: Option<PathBuf>,
+     relative_path: OnceCell<Option<PathBuf>>,
+     /// Lazily-computed workspace root for this document (the ancestor that contains a `.git` /
+@@ -742,6 +812,8 @@ pub fn from(
+             selections: HashMap::default(),
+             inlay_hints: HashMap::default(),
+             inlay_hints_oudated: false,
++            inline_completions: InlineCompletions::default(),
++            inline_completion_overlays: Vec::new(),
+             view_data: Default::default(),
+             indent_style: DEFAULT_INDENT,
+             editor_config: EditorConfig::default(),
+diff --git a/helix-view/src/editor.rs b/helix-view/src/editor.rs
+index adced188..2920d65e 100644
+--- a/helix-view/src/editor.rs
++++ b/helix-view/src/editor.rs
+@@ -353,6 +353,14 @@ pub struct Config {
+         deserialize_with = "deserialize_duration_millis"
+     )]
+     pub completion_timeout: Duration,
++    /// Time in milliseconds after typing before inline completions are requested. Defaults to 150ms.
++    #[serde(
++        serialize_with = "serialize_duration_millis",
++        deserialize_with = "deserialize_duration_millis"
++    )]
++    pub inline_completion_timeout: Duration,
++    /// Automatically request inline completions while typing. Defaults to true.
++    pub inline_completion_auto_trigger: bool,
+     /// Whether to insert the completion suggestion on hover. Defaults to true.
+     pub preview_completion_insert: bool,
+     pub completion_trigger_len: u8,
+@@ -1198,6 +1206,8 @@ fn default() -> Self {
+             auto_save: AutoSave::default(),
+             idle_timeout: Duration::from_millis(250),
+             completion_timeout: Duration::from_millis(250),
++            inline_completion_timeout: Duration::from_millis(150),
++            inline_completion_auto_trigger: true,
+             preview_completion_insert: true,
+             completion_trigger_len: 2,
+             auto_info: true,
+@@ -2557,6 +2567,8 @@ pub fn enter_normal_mode(&mut self) {
+             doc.set_selection(view.id, selection);
+             doc.restore_cursor = false;
+         }
++
++        doc.inline_completions.take_and_clear();
+     }
+ 
+     pub fn current_stack_frame(&self) -> Option<&dap::StackFrame> {
+diff --git a/helix-view/src/handlers.rs b/helix-view/src/handlers.rs
+index 6ead32f5..906321f3 100644
+--- a/helix-view/src/handlers.rs
++++ b/helix-view/src/handlers.rs
+@@ -28,6 +28,8 @@ pub struct Handlers {
+     pub pull_diagnostics: Sender<lsp::PullDiagnosticsEvent>,
+     pub pull_all_documents_diagnostics: Sender<lsp::PullAllDocumentsDiagnosticsEvent>,
+     pub code_action_hint: Sender<lsp::CodeActionHintEvent>,
++    /// Auto-trigger via channel; manual trigger bypasses debounce (see helix-term handler)
++    pub inline_completions: Sender<()>,
+ }
+ 
+ impl Handlers {
+diff --git a/helix-view/src/view.rs b/helix-view/src/view.rs
+index d211d8e6..c654ed53 100644
+--- a/helix-view/src/view.rs
++++ b/helix-view/src/view.rs
+@@ -1,6 +1,7 @@
+ use crate::{
+     align_view,
+     annotations::diagnostics::InlineDiagnostics,
++    annotations::inline_completion::InlineCompletionLines,
+     document::{DocumentColorSwatches, DocumentInlayHints},
+     editor::{GutterConfig, GutterType},
+     graphics::Rect,
+@@ -509,6 +510,30 @@ pub fn text_annotations<'a>(
+             }
+         }
+ 
++        // Add inline completion ghost text overlays
++        let inline_completion_style =
++            theme.and_then(|t| t.find_highlight("ui.virtual.inline-completion"));
++
++        // All overlays (replace chars in-place, no cursor shift)
++        if !doc.inline_completion_overlays.is_empty() {
++            text_annotations.add_overlay(&doc.inline_completion_overlays, inline_completion_style);
++        }
++
++        // Multi-line ghost text: reserve virtual lines for additional lines
++        if let Some(completion) = doc.inline_completions.current() {
++            if !completion.additional_lines.is_empty() {
++                let cursor = doc
++                    .selection(self.id)
++                    .primary()
++                    .cursor(doc.text().slice(..));
++                let cursor_line = doc.text().char_to_line(cursor);
++                text_annotations.add_line_annotation(InlineCompletionLines::new(
++                    cursor_line,
++                    &completion.additional_lines,
++                ));
++            }
++        }
++
+         let width = self.inner_width(doc);
+         let enable_cursor_line = self
+             .diagnostics_handler
